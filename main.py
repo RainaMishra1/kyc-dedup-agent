@@ -2,7 +2,7 @@ import os
 import json
 import psycopg2
 import logging
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, validator
 from psycopg2.extras import RealDictCursor
 from psycopg2.pool import SimpleConnectionPool
@@ -14,7 +14,7 @@ from typing import List, Dict, Any, Optional
 from contextlib import contextmanager
 
 # ============================================================================
-# LOGGING CONFIGURATION
+# LOGGING
 # ============================================================================
 
 logging.basicConfig(
@@ -24,17 +24,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# FASTAPI APP INITIALIZATION
+# FASTAPI APP
 # ============================================================================
 
 app = FastAPI(
-    title="KYC Deduplication & Blacklist Engine",
-    description="Automated Real-Time Risk & Identity Verification Pipeline",
-    version="2.0.0"
+    title="KYC Deduplication & Loan Management System",
+    description="KYC Deduplication with Aadhaar as Primary Key + Multiple Loans",
+    version="3.0.0"
 )
 
 # ============================================================================
-# DATABASE CONNECTION POOL
+# DATABASE CONNECTION
 # ============================================================================
 
 db_pool = SimpleConnectionPool(
@@ -49,7 +49,6 @@ db_pool = SimpleConnectionPool(
 
 @contextmanager
 def get_db_connection():
-    """Context manager for database connections"""
     conn = db_pool.getconn()
     try:
         yield conn
@@ -57,19 +56,16 @@ def get_db_connection():
         db_pool.putconn(conn)
 
 # ============================================================================
-# CONFIGURATION & WEIGHTS
+# CONFIGURATION
 # ============================================================================
 
 class DedupeWeights:
-    """Field weights for cumulative scoring"""
     PAN = 0.35
-    AADHAAR_LAST4 = 0.25
+    AADHAAR = 0.25
     NAME = 0.15
     DOB = 0.12
-    PHONE = 0.08
+    MOBILE = 0.08  # This corresponds to phone in request, stored as mobile_number in DB
     ADDRESS = 0.05
-    
-    TOTAL = 1.0
     
     BLACKLIST_MULTIPLIER = 1.5
     FUZZY_NAME_THRESHOLD = 0.85
@@ -82,17 +78,16 @@ class DedupeWeights:
     WEAK_MATCH = 0.30
 
 # ============================================================================
-# PYDANTIC MODELS WITH VALIDATION
+# PYDANTIC MODELS
 # ============================================================================
 
 class ApplicantReads(BaseModel):
-    """Applicant data model with validation"""
-    name: str = Field(..., min_length=2, max_length=255, example="Rahul Sharma")
-    dob: str = Field(..., example="1992-05-14")
-    pan: str = Field(..., min_length=10, max_length=10, example="ABCDE1234F")
-    phone: str = Field(..., min_length=10, max_length=15, example="9876543210")
-    aadhaar_last4: str = Field(..., min_length=4, max_length=4, example="5678")
-    address: str = Field(..., min_length=5, max_length=500, example="Flat 402, MG Road, Mumbai")
+    name: str = Field(..., min_length=2, max_length=255)
+    dob: str = Field(..., example="1992-05-12")
+    pan: str = Field(..., min_length=10, max_length=10)
+    phone: str = Field(..., min_length=10, max_length=15)  # Now using 'phone' to match request
+    aadhaar_number: str = Field(..., min_length=12, max_length=12)
+    address: str = Field(..., min_length=5, max_length=500)
     
     @validator('dob')
     def validate_dob(cls, v):
@@ -101,15 +96,15 @@ class ApplicantReads(BaseModel):
             if dob_date > datetime.now():
                 raise ValueError("Date of birth cannot be in future")
             return v
-        except ValueError as e:
-            raise ValueError(f"Invalid DOB format. Use YYYY-MM-DD: {str(e)}")
+        except ValueError:
+            raise ValueError("Invalid DOB format. Use YYYY-MM-DD")
     
     @validator('pan')
     def validate_pan(cls, v):
         v = v.upper().strip()
         pattern = r'^[A-Z]{5}[0-9]{4}[A-Z]{1}$'
         if not re.match(pattern, v):
-            raise ValueError(f"PAN must be 10 characters: 5 letters, 4 digits, 1 letter. Got: {v}")
+            raise ValueError(f"Invalid PAN format: {v}")
         return v
     
     @validator('phone')
@@ -119,22 +114,23 @@ class ApplicantReads(BaseModel):
             raise ValueError("Phone number must have at least 10 digits")
         return cleaned[-10:]
     
-    @validator('aadhaar_last4')
+    @validator('aadhaar_number')
     def validate_aadhaar(cls, v):
         v = v.strip()
         if not v.isdigit():
-            raise ValueError("Aadhaar last 4 must be digits")
-        if len(v) != 4:
-            raise ValueError("Aadhaar last 4 must be exactly 4 digits")
+            raise ValueError("Aadhaar must contain only digits")
+        if len(v) != 12:
+            raise ValueError("Aadhaar must be exactly 12 digits")
         return v
     
     def normalize(self) -> Dict[str, Any]:
+        # Map 'phone' to 'mobile_number' for database consistency
         return {
             'name': self.name.strip().lower(),
             'dob': self.dob,
             'pan': self.pan.upper().strip(),
-            'phone': ''.join(filter(str.isdigit, self.phone))[-10:],
-            'aadhaar_last4': self.aadhaar_last4.strip(),
+            'mobile_number': ''.join(filter(str.isdigit, self.phone))[-10:],  # DB column is mobile_number
+            'aadhaar_number': self.aadhaar_number.strip(),
             'address': self.address.strip().lower()
         }
 
@@ -142,12 +138,25 @@ class KycEventPayload(BaseModel):
     wakes_on: str = Field("kyc.dedup_requested")
     reads: ApplicantReads
 
+class LoanApplication(BaseModel):
+    name: str = Field(..., min_length=2, max_length=255)
+    dob: str = Field(..., example="1992-05-12")
+    aadhaar_number: str = Field(..., min_length=12, max_length=12)
+    pan: str = Field(..., min_length=10, max_length=10)
+    mobile_number: str = Field(..., min_length=10, max_length=15)  # Kept as mobile_number
+    email: Optional[str] = Field(None, max_length=100)
+    address: str = Field(..., min_length=5, max_length=500)
+    loan_type: str = Field(..., example="Home Loan")
+    loan_amount: float = Field(..., gt=0)
+    loan_account_no: str = Field(..., example="HL001")
+    interest_rate: Optional[float] = Field(None, gt=0, le=30)
+    loan_term_months: Optional[int] = Field(None, gt=0, le=360)
+
 # ============================================================================
 # FIELD COMPARISON FUNCTIONS
 # ============================================================================
 
 def compare_field(field_type: str, value1: str, value2: str) -> float:
-    """Compare two field values and return similarity score (0.0 to 1.0)"""
     if not value1 or not value2:
         return 0.0
     
@@ -159,10 +168,8 @@ def compare_field(field_type: str, value1: str, value2: str) -> float:
         v2_clean = re.sub(r'[^A-Z0-9]', '', v2.upper())
         return 1.0 if v1_clean == v2_clean else 0.0
     
-    elif field_type == 'aadhaar_last4':
-        v1_last4 = v1[-4:] if len(v1) >= 4 else v1
-        v2_last4 = v2[-4:] if len(v2) >= 4 else v2
-        return 1.0 if v1_last4 == v2_last4 else 0.0
+    elif field_type == 'aadhaar_number':
+        return 1.0 if v1 == v2 else 0.0
     
     elif field_type == 'name':
         similarity = JaroWinkler.similarity(v1.lower(), v2.lower())
@@ -181,7 +188,7 @@ def compare_field(field_type: str, value1: str, value2: str) -> float:
         except:
             return 1.0 if v1 == v2 else 0.0
     
-    elif field_type == 'phone':
+    elif field_type == 'mobile_number':  # This is what we use in DB and after normalization
         v1_clean = re.sub(r'\D', '', v1)[-10:]
         v2_clean = re.sub(r'\D', '', v2)[-10:]
         return 1.0 if v1_clean == v2_clean else 0.0
@@ -193,20 +200,19 @@ def compare_field(field_type: str, value1: str, value2: str) -> float:
     return 0.0
 
 # ============================================================================
-# CUMULATIVE SCORING ENGINE
+# CUMULATIVE SCORING
 # ============================================================================
 
 def calculate_cumulative_score(applicant: Dict, db_record: Dict, is_blacklist: bool = False) -> tuple:
-    """Calculate cumulative confidence score for a single database record"""
     score = 0.0
     matched_fields = []
     
     field_weights = {
         'pan': DedupeWeights.PAN,
-        'aadhaar_last4': DedupeWeights.AADHAAR_LAST4,
+        'aadhaar_number': DedupeWeights.AADHAAR,
         'name': DedupeWeights.NAME,
         'dob': DedupeWeights.DOB,
-        'phone': DedupeWeights.PHONE,
+        'mobile_number': DedupeWeights.MOBILE,  # DB column
         'address': DedupeWeights.ADDRESS
     }
     
@@ -216,11 +222,7 @@ def calculate_cumulative_score(applicant: Dict, db_record: Dict, is_blacklist: b
             if match_score > 0:
                 field_score = weight * match_score
                 score += field_score
-                matched_fields.append({
-                    'field': field,
-                    'similarity': round(match_score, 2)
-                    # Removed: 'weight' and 'contribution'
-                })
+                matched_fields.append(field)
     
     if is_blacklist and score > 0:
         score = min(score * DedupeWeights.BLACKLIST_MULTIPLIER, 1.0)
@@ -228,11 +230,172 @@ def calculate_cumulative_score(applicant: Dict, db_record: Dict, is_blacklist: b
     return score, matched_fields
 
 # ============================================================================
-# LOAN ACCOUNT CHECK FUNCTION
+# KYC DEDUP DATABASE FUNCTIONS
 # ============================================================================
 
-def check_customer_loans(cursor, customer_id: int) -> Dict:
-    """Check if a customer has multiple loan accounts"""
+def search_blacklist(cursor, applicant: Dict) -> List[Dict]:
+    matches = []
+    
+    cursor.execute("""
+        SELECT 
+            'BLACKLIST_DB' as source,
+            blacklist_id::text as id,
+            name,
+            reason,
+            pan,
+            aadhaar_number,
+            dob,
+            mobile_number
+        FROM blacklist_record 
+        WHERE pan = %s OR (aadhaar_number = %s AND dob = %s)
+        LIMIT 10;
+    """, (applicant['pan'], applicant['aadhaar_number'], applicant['dob']))
+    
+    records = cursor.fetchall()
+    for record in records:
+        record_dict = dict(record)
+        record_dict['address'] = ''
+        score, matched_fields = calculate_cumulative_score(applicant, record_dict, is_blacklist=True)
+        if score > 0:
+            matches.append({
+                'record': record_dict,
+                'score': score,
+                'matched_fields': matched_fields,
+                'source': 'BLACKLIST'
+            })
+    
+    if not matches:
+        cursor.execute("""
+            SELECT 
+                'BLACKLIST_DB' as source,
+                blacklist_id::text as id,
+                name,
+                reason,
+                pan,
+                aadhaar_number,
+                dob,
+                mobile_number
+            FROM blacklist_record 
+            WHERE mobile_number = %s
+            LIMIT 5;
+        """, (applicant['mobile_number'],))
+        
+        records = cursor.fetchall()
+        for record in records:
+            record_dict = dict(record)
+            record_dict['address'] = ''
+            score, matched_fields = calculate_cumulative_score(applicant, record_dict, is_blacklist=True)
+            if score > 0 and score < 1.0:
+                matches.append({
+                    'record': record_dict,
+                    'score': score,
+                    'matched_fields': matched_fields,
+                    'source': 'BLACKLIST'
+                })
+    
+    return matches
+
+def search_customers_kyc(cursor, applicant: Dict) -> List[Dict]:
+    matches = []
+    
+    cursor.execute("""
+        SELECT 
+            'CUSTOMER_DB' as source,
+            customer_id::text as id,
+            name,
+            address,
+            pan,
+            aadhaar_number,
+            dob,
+            mobile_number
+        FROM existing_customers_rec 
+        WHERE pan = %s OR (aadhaar_number = %s AND dob = %s)
+        LIMIT 10;
+    """, (applicant['pan'], applicant['aadhaar_number'], applicant['dob']))
+    
+    records = cursor.fetchall()
+    for record in records:
+        record_dict = dict(record)
+        score, matched_fields = calculate_cumulative_score(applicant, record_dict, is_blacklist=False)
+        if score > 0:
+            matches.append({
+                'record': record_dict,
+                'score': score,
+                'matched_fields': matched_fields,
+                'source': 'CUSTOMER'
+            })
+    
+    cursor.execute("""
+        SELECT 
+            'CUSTOMER_DB' as source,
+            customer_id::text as id,
+            name,
+            address,
+            pan,
+            aadhaar_number,
+            dob,
+            mobile_number
+        FROM existing_customers_rec 
+        WHERE mobile_number = %s
+        LIMIT 5;
+    """, (applicant['mobile_number'],))
+    
+    records = cursor.fetchall()
+    for record in records:
+        record_dict = dict(record)
+        if any(m['record']['id'] == record_dict['id'] for m in matches):
+            continue
+        score, matched_fields = calculate_cumulative_score(applicant, record_dict, is_blacklist=False)
+        if score > 0 and score < 0.90:
+            matches.append({
+                'record': record_dict,
+                'score': score,
+                'matched_fields': matched_fields,
+                'source': 'CUSTOMER'
+            })
+    
+    return matches
+
+def fuzzy_name_search_kyc(cursor, applicant: Dict, existing_matches: List) -> List[Dict]:
+    matches = []
+    
+    cursor.execute("""
+        SELECT 
+            'CUSTOMER_DB' as source,
+            customer_id::text as id,
+            name,
+            address,
+            pan,
+            aadhaar_number,
+            dob,
+            mobile_number
+        FROM existing_customers_rec 
+        WHERE dob = %s
+        LIMIT 20;
+    """, (applicant['dob'],))
+    
+    candidates = cursor.fetchall()
+    
+    for candidate in candidates:
+        candidate_dict = dict(candidate)
+        if any(m['record']['id'] == candidate_dict['id'] for m in existing_matches):
+            continue
+        
+        db_name = candidate_dict["name"].strip().lower()
+        name_score = JaroWinkler.similarity(applicant['name'], db_name)
+        
+        if name_score >= DedupeWeights.FUZZY_NAME_THRESHOLD:
+            score = name_score * DedupeWeights.NAME
+            matches.append({
+                'record': candidate_dict,
+                'score': score,
+                'matched_fields': ['name'],
+                'source': 'CUSTOMER'
+            })
+    
+    return matches
+
+def check_customer_loans_kyc(cursor, customer_id: int) -> Dict:
     cursor.execute("""
         SELECT 
             COUNT(*) as loan_count,
@@ -262,185 +425,15 @@ def check_customer_loans(cursor, customer_id: int) -> Dict:
         'has_multiple_loans': False
     }
 
-# ============================================================================
-# DATABASE QUERY FUNCTIONS
-# ============================================================================
-
-def search_blacklist(cursor, applicant: Dict) -> List[Dict]:
-    """Search for applicant in blacklist_record table"""
-    matches = []
-    
+def store_dedup_result(cursor, customer_id: Optional[int], matched_customer_id: Optional[int], 
+                       match_score: float, result_type: str, explanation: str):
     cursor.execute("""
-        SELECT 
-            'BLACKLIST_DB' as source,
-            blacklist_id::text as id,
-            name,
-            reason,
-            pan,
-            aadhaar_last4,
-            dob,
-            phone
-        FROM blacklist_record 
-        WHERE pan = %s OR (aadhaar_last4 = %s AND dob = %s)
-        LIMIT 10;
-    """, (applicant['pan'], applicant['aadhaar_last4'], applicant['dob']))
-    
-    records = cursor.fetchall()
-    for record in records:
-        record_dict = dict(record)
-        record_dict['address'] = ''
-        score, matched_fields = calculate_cumulative_score(applicant, record_dict, is_blacklist=True)
-        if score > 0:
-            matches.append({
-                'record': record_dict,
-                'score': score,
-                'matched_fields': matched_fields,
-                'source': 'BLACKLIST'
-            })
-    
-    if not matches:
-        cursor.execute("""
-            SELECT 
-                'BLACKLIST_DB' as source,
-                blacklist_id::text as id,
-                name,
-                reason,
-                pan,
-                aadhaar_last4,
-                dob,
-                phone
-            FROM blacklist_record 
-            WHERE phone = %s
-            LIMIT 5;
-        """, (applicant['phone'],))
-        
-        records = cursor.fetchall()
-        for record in records:
-            record_dict = dict(record)
-            record_dict['address'] = ''
-            score, matched_fields = calculate_cumulative_score(applicant, record_dict, is_blacklist=True)
-            if score > 0 and score < 1.0:
-                matches.append({
-                    'record': record_dict,
-                    'score': score,
-                    'matched_fields': matched_fields,
-                    'source': 'BLACKLIST'
-                })
-    
-    return matches
+        INSERT INTO deduplication_results 
+        (customer_id, matched_customer_id, match_score, result_type, explanation)
+        VALUES (%s, %s, %s, %s, %s)
+    """, (customer_id, matched_customer_id, match_score, result_type, explanation))
 
-def search_customers(cursor, applicant: Dict) -> List[Dict]:
-    """Search for applicant in existing_customers_rec table"""
-    matches = []
-    
-    cursor.execute("""
-        SELECT 
-            'CUSTOMER_DB' as source,
-            customer_id::text as id,
-            name,
-            address,
-            pan,
-            aadhaar_last4,
-            dob,
-            phone
-        FROM existing_customers_rec 
-        WHERE pan = %s OR (aadhaar_last4 = %s AND dob = %s)
-        LIMIT 10;
-    """, (applicant['pan'], applicant['aadhaar_last4'], applicant['dob']))
-    
-    records = cursor.fetchall()
-    for record in records:
-        record_dict = dict(record)
-        score, matched_fields = calculate_cumulative_score(applicant, record_dict, is_blacklist=False)
-        if score > 0:
-            matches.append({
-                'record': record_dict,
-                'score': score,
-                'matched_fields': matched_fields,
-                'source': 'CUSTOMER'
-            })
-    
-    cursor.execute("""
-        SELECT 
-            'CUSTOMER_DB' as source,
-            customer_id::text as id,
-            name,
-            address,
-            pan,
-            aadhaar_last4,
-            dob,
-            phone
-        FROM existing_customers_rec 
-        WHERE phone = %s
-        LIMIT 5;
-    """, (applicant['phone'],))
-    
-    records = cursor.fetchall()
-    for record in records:
-        record_dict = dict(record)
-        if any(m['record']['id'] == record_dict['id'] for m in matches):
-            continue
-        score, matched_fields = calculate_cumulative_score(applicant, record_dict, is_blacklist=False)
-        if score > 0 and score < 0.90:
-            matches.append({
-                'record': record_dict,
-                'score': score,
-                'matched_fields': matched_fields,
-                'source': 'CUSTOMER'
-            })
-    
-    return matches
-
-def fuzzy_name_search(cursor, applicant: Dict, existing_matches: List) -> List[Dict]:
-    """Search for fuzzy name matches with same DOB"""
-    matches = []
-    
-    cursor.execute("""
-        SELECT 
-            'CUSTOMER_DB' as source,
-            customer_id::text as id,
-            name,
-            address,
-            pan,
-            aadhaar_last4,
-            dob,
-            phone
-        FROM existing_customers_rec 
-        WHERE dob = %s
-        LIMIT 20;
-    """, (applicant['dob'],))
-    
-    candidates = cursor.fetchall()
-    
-    for candidate in candidates:
-        candidate_dict = dict(candidate)
-        if any(m['record']['id'] == candidate_dict['id'] for m in existing_matches):
-            continue
-        
-        db_name = candidate_dict["name"].strip().lower()
-        name_score = JaroWinkler.similarity(applicant['name'], db_name)
-        
-        if name_score >= DedupeWeights.FUZZY_NAME_THRESHOLD:
-            score = name_score * DedupeWeights.NAME
-            matches.append({
-                'record': candidate_dict,
-                'score': score,
-                'matched_fields': [{
-                    'field': 'name (fuzzy)',
-                    'similarity': round(name_score, 2)
-                }],
-                'source': 'CUSTOMER'
-            })
-    
-    return matches
-
-# ============================================================================
-# VERDICT DECISION ENGINE
-# ============================================================================
-
-def determine_verdict(confidence: float, is_blacklist: bool, has_matches: bool, loan_info: Dict = None) -> dict:
-    """Determine status and verdict based on confidence score and loan information"""
-    
+def determine_verdict_kyc(confidence: float, is_blacklist: bool, has_matches: bool, loan_info: Dict = None) -> dict:
     if not has_matches:
         return {
             'status': 'CLEAR',
@@ -506,27 +499,96 @@ def determine_verdict(confidence: float, is_blacklist: bool, has_matches: bool, 
         }
 
 # ============================================================================
-# STORE DEDUPLICATION RESULT
+# LOAN MANAGEMENT FUNCTIONS (unchanged)
 # ============================================================================
 
-def store_dedup_result(cursor, customer_id: Optional[int], matched_customer_id: Optional[int], 
-                       match_score: float, result_type: str, explanation: str):
-    """Store deduplication result in deduplication_results table"""
+def find_customer_by_aadhaar(cursor, aadhaar_number: str) -> Optional[Dict]:
     cursor.execute("""
-        INSERT INTO deduplication_results 
-        (customer_id, matched_customer_id, match_score, result_type, explanation)
-        VALUES (%s, %s, %s, %s, %s)
-    """, (customer_id, matched_customer_id, match_score, result_type, explanation))
+        SELECT customer_id, name, dob, aadhaar_number, pan, mobile_number, email, address
+        FROM existing_customers_rec 
+        WHERE aadhaar_number = %s
+    """, (aadhaar_number,))
+    return cursor.fetchone()
+
+def find_customer_by_mobile(cursor, mobile_number: str) -> Optional[Dict]:
+    cursor.execute("""
+        SELECT customer_id, name, dob, aadhaar_number, pan, mobile_number, email, address
+        FROM existing_customers_rec 
+        WHERE mobile_number = %s
+    """, (mobile_number,))
+    return cursor.fetchone()
+
+def find_customer_by_pan(cursor, pan: str) -> Optional[Dict]:
+    cursor.execute("""
+        SELECT customer_id, name, dob, aadhaar_number, pan, mobile_number, email, address
+        FROM existing_customers_rec 
+        WHERE pan = %s
+    """, (pan,))
+    return cursor.fetchone()
+
+def get_customer_loans(cursor, customer_id: int) -> List[Dict]:
+    cursor.execute("""
+        SELECT 
+            loan_id, loan_account_no, loan_type, loan_amount, 
+            interest_rate, loan_term_months, loan_status, 
+            application_date, approval_date, disbursement_date
+        FROM loan_accounts 
+        WHERE customer_id = %s
+        ORDER BY application_date DESC
+    """, (customer_id,))
+    return cursor.fetchall()
+
+def create_customer(cursor, customer_data: Dict) -> int:
+    cursor.execute("""
+        INSERT INTO existing_customers_rec 
+        (name, dob, aadhaar_number, pan, mobile_number, email, address)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        RETURNING customer_id
+    """, (
+        customer_data['name'],
+        customer_data['dob'],
+        customer_data['aadhaar_number'],
+        customer_data['pan'],
+        customer_data['mobile_number'],
+        customer_data.get('email'),
+        customer_data['address']
+    ))
+    return cursor.fetchone()['customer_id']
+
+def create_loan(cursor, customer_id: int, loan_data: Dict) -> int:
+    cursor.execute("""
+        INSERT INTO loan_accounts 
+        (customer_id, loan_account_no, loan_type, loan_amount, 
+         interest_rate, loan_term_months, loan_status, application_date)
+        VALUES (%s, %s, %s, %s, %s, %s, 'ACTIVE', CURRENT_DATE)
+        RETURNING loan_id
+    """, (
+        customer_id,
+        loan_data['loan_account_no'],
+        loan_data['loan_type'],
+        loan_data['loan_amount'],
+        loan_data.get('interest_rate'),
+        loan_data.get('loan_term_months')
+    ))
+    return cursor.fetchone()['loan_id']
+
+def check_blacklist_loan(cursor, aadhaar_number: str, mobile_number: str, pan: str) -> Optional[Dict]:
+    cursor.execute("""
+        SELECT blacklist_id, name, reason
+        FROM blacklist_record 
+        WHERE aadhaar_number = %s OR mobile_number = %s OR pan = %s
+    """, (aadhaar_number, mobile_number, pan))
+    return cursor.fetchone()
 
 # ============================================================================
-# MAIN DEDUPLICATION API ENDPOINT
+# KYC DEDUP ENDPOINT
 # ============================================================================
 
 @app.post("/api/v1/kyc/dedup")
 def process_dedup_api(event: KycEventPayload):
-    """Process KYC deduplication request with cumulative confidence scoring"""
+    """KYC Deduplication with cumulative confidence scoring"""
     
-    applicant = event.reads.normalize()
+    applicant = event.reads.normalize()  # Now returns dict with 'mobile_number'
     
     logger.info(f"Processing dedup request for: {applicant['name']} (PAN: {applicant['pan']})")
     
@@ -535,8 +597,8 @@ def process_dedup_api(event: KycEventPayload):
             cursor = conn.cursor(cursor_factory=RealDictCursor)
             
             blacklist_matches = search_blacklist(cursor, applicant)
-            customer_matches = search_customers(cursor, applicant)
-            fuzzy_matches = fuzzy_name_search(cursor, applicant, customer_matches)
+            customer_matches = search_customers_kyc(cursor, applicant)
+            fuzzy_matches = fuzzy_name_search_kyc(cursor, applicant, customer_matches)
             
             all_matches = blacklist_matches + customer_matches + fuzzy_matches
             all_matches.sort(key=lambda x: x['score'], reverse=True)
@@ -551,10 +613,10 @@ def process_dedup_api(event: KycEventPayload):
                 best_match = all_matches[0]
                 if best_match['source'] == 'CUSTOMER':
                     matched_customer_id = int(best_match['record']['id'])
-                    loan_info = check_customer_loans(cursor, matched_customer_id)
+                    loan_info = check_customer_loans_kyc(cursor, matched_customer_id)
                     
                     if loan_info and loan_info['has_multiple_loans'] and final_confidence >= 0.70:
-                        verdict = determine_verdict(final_confidence, has_blacklist, bool(all_matches), loan_info)
+                        verdict = determine_verdict_kyc(final_confidence, has_blacklist, bool(all_matches), loan_info)
                         
                         store_dedup_result(
                             cursor, 
@@ -562,7 +624,7 @@ def process_dedup_api(event: KycEventPayload):
                             matched_customer_id,
                             round(final_confidence, 2),
                             'SAME_CUSTOMER_MULTIPLE_LOANS',
-                            f"Customer has {loan_info['loan_count']} existing loans. Loan accounts: {', '.join(loan_info['loan_accounts'])}"
+                            f"Customer has {loan_info['loan_count']} existing loans"
                         )
                         conn.commit()
                         
@@ -582,13 +644,7 @@ def process_dedup_api(event: KycEventPayload):
                                         "name": m['record'].get('name', 'Unknown'),
                                         "source": m['source'],
                                         "score": round(m['score'], 2),
-                                        "matched_fields": [
-                                            {
-                                                "field": f['field'],
-                                                "similarity": f['similarity']
-                                            }
-                                            for f in m['matched_fields']
-                                        ]
+                                        "matched_fields": m['matched_fields']
                                     }
                                     for m in all_matches[:5]
                                 ],
@@ -597,7 +653,7 @@ def process_dedup_api(event: KycEventPayload):
                         }
                         return response
             
-            verdict = determine_verdict(final_confidence, has_blacklist, bool(all_matches))
+            verdict = determine_verdict_kyc(final_confidence, has_blacklist, bool(all_matches))
             
             logger.info(
                 f"Decision for {applicant['name']}: {verdict['verdict']} "
@@ -614,7 +670,7 @@ def process_dedup_api(event: KycEventPayload):
                     matched_customer_id,
                     round(final_confidence, 2),
                     verdict['verdict'],
-                    f"Match found with confidence {final_confidence:.2%}. Action: {verdict['action']}"
+                    f"Match found with confidence {final_confidence:.2%}"
                 )
                 conn.commit()
             
@@ -635,13 +691,7 @@ def process_dedup_api(event: KycEventPayload):
                                 "name": m['record'].get('name', 'Unknown'),
                                 "source": m['source'],
                                 "score": round(m['score'], 2),
-                                "matched_fields": [
-                                    {
-                                        "field": f['field'],
-                                        "similarity": f['similarity']
-                                    }
-                                    for f in m['matched_fields']
-                                ]
+                                "matched_fields": m['matched_fields']
                             }
                             for m in all_matches[:5]
                         ],
@@ -684,54 +734,225 @@ def process_dedup_api(event: KycEventPayload):
         raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}")
 
 # ============================================================================
-# HEALTH CHECK ENDPOINT
+# LOAN APPLICATION ENDPOINT
+# ============================================================================
+
+@app.post("/api/v1/loan/apply")
+def apply_loan(application: LoanApplication):
+    """Apply for a new loan with deduplication"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            
+            applicant = {
+                'name': application.name.strip().lower(),
+                'dob': application.dob,
+                'aadhaar_number': application.aadhaar_number.strip(),
+                'pan': application.pan.upper().strip(),
+                'mobile_number': ''.join(filter(str.isdigit, application.mobile_number))[-10:],
+                'email': application.email,
+                'address': application.address.strip().lower()
+            }
+            
+            loan_data = {
+                'loan_account_no': application.loan_account_no,
+                'loan_type': application.loan_type,
+                'loan_amount': application.loan_amount,
+                'interest_rate': application.interest_rate,
+                'loan_term_months': application.loan_term_months
+            }
+            
+            # Check Blacklist
+            blacklist = check_blacklist_loan(
+                cursor, 
+                applicant['aadhaar_number'], 
+                applicant['mobile_number'], 
+                applicant['pan']
+            )
+            
+            if blacklist:
+                return {
+                    "status": "REJECTED",
+                    "message": "Customer is BLACKLISTED",
+                    "reason": blacklist['reason']
+                }
+            
+            # Check by Aadhaar
+            existing = find_customer_by_aadhaar(cursor, applicant['aadhaar_number'])
+            
+            if existing:
+                customer_id = existing['customer_id']
+                
+                cursor.execute("SELECT loan_id FROM loan_accounts WHERE loan_account_no = %s", 
+                             (loan_data['loan_account_no'],))
+                if cursor.fetchone():
+                    return {
+                        "status": "ERROR",
+                        "message": f"Loan account {loan_data['loan_account_no']} already exists"
+                    }
+                
+                loan_id = create_loan(cursor, customer_id, loan_data)
+                loans = get_customer_loans(cursor, customer_id)
+                conn.commit()
+                
+                return {
+                    "status": "EXISTING_CUSTOMER",
+                    "verdict": "EXISTING_CUSTOMER_NEW_LOAN",
+                    "message": "New loan added to existing customer",
+                    "customer": existing,
+                    "new_loan": {
+                        "loan_id": loan_id,
+                        "loan_account_no": loan_data['loan_account_no'],
+                        "loan_type": loan_data['loan_type'],
+                        "loan_amount": loan_data['loan_amount']
+                    },
+                    "all_loans": loans,
+                    "total_loans": len(loans)
+                }
+            
+            # Check by Mobile
+            existing = find_customer_by_mobile(cursor, applicant['mobile_number'])
+            
+            if existing:
+                customer_id = existing['customer_id']
+                
+                cursor.execute("SELECT loan_id FROM loan_accounts WHERE loan_account_no = %s", 
+                             (loan_data['loan_account_no'],))
+                if cursor.fetchone():
+                    return {
+                        "status": "ERROR",
+                        "message": f"Loan account {loan_data['loan_account_no']} already exists"
+                    }
+                
+                loan_id = create_loan(cursor, customer_id, loan_data)
+                loans = get_customer_loans(cursor, customer_id)
+                conn.commit()
+                
+                return {
+                    "status": "EXISTING_CUSTOMER",
+                    "verdict": "EXISTING_CUSTOMER_NEW_LOAN",
+                    "message": "New loan added to existing customer (found by mobile)",
+                    "customer": existing,
+                    "new_loan": {
+                        "loan_id": loan_id,
+                        "loan_account_no": loan_data['loan_account_no'],
+                        "loan_type": loan_data['loan_type'],
+                        "loan_amount": loan_data['loan_amount']
+                    },
+                    "all_loans": loans,
+                    "total_loans": len(loans)
+                }
+            
+            # Check PAN conflict
+            existing = find_customer_by_pan(cursor, applicant['pan'])
+            
+            if existing:
+                return {
+                    "status": "FLAGGED",
+                    "verdict": "PAN_CONFLICT",
+                    "message": "PAN exists with different Aadhaar/Mobile",
+                    "existing_customer": {
+                        "customer_id": existing['customer_id'],
+                        "name": existing['name'],
+                        "aadhaar_number": existing['aadhaar_number'],
+                        "mobile_number": existing['mobile_number']
+                    }
+                }
+            
+            # New Customer
+            customer_id = create_customer(cursor, applicant)
+            loan_id = create_loan(cursor, customer_id, loan_data)
+            loans = get_customer_loans(cursor, customer_id)
+            conn.commit()
+            
+            return {
+                "status": "NEW_CUSTOMER",
+                "verdict": "NEW_CUSTOMER",
+                "message": "New customer created with loan",
+                "customer": {
+                    "customer_id": customer_id,
+                    "name": application.name,
+                    "dob": application.dob,
+                    "aadhaar_number": applicant['aadhaar_number'],
+                    "pan": applicant['pan'],
+                    "mobile_number": applicant['mobile_number'],
+                    "email": application.email,
+                    "address": application.address
+                },
+                "new_loan": {
+                    "loan_id": loan_id,
+                    "loan_account_no": loan_data['loan_account_no'],
+                    "loan_type": loan_data['loan_type'],
+                    "loan_amount": loan_data['loan_amount']
+                },
+                "all_loans": loans,
+                "total_loans": len(loans)
+            }
+            
+    except Exception as e:
+        logger.error(f"Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================================================
+# CUSTOMER PROFILE
+# ============================================================================
+
+@app.get("/api/v1/customer/{identifier}")
+def get_customer_profile(identifier: str):
+    """Get customer by Aadhaar, Mobile, or PAN"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            
+            cursor.execute("""
+                SELECT customer_id, name, dob, aadhaar_number, pan, mobile_number, email, address
+                FROM existing_customers_rec 
+                WHERE aadhaar_number = %s OR mobile_number = %s OR pan = %s
+            """, (identifier, identifier, identifier))
+            
+            customer = cursor.fetchone()
+            
+            if not customer:
+                raise HTTPException(status_code=404, detail="Customer not found")
+            
+            loans = get_customer_loans(cursor, customer['customer_id'])
+            
+            return {
+                "status": "SUCCESS",
+                "customer": customer,
+                "loans": loans,
+                "total_loans": len(loans),
+                "has_multiple_loans": len(loans) > 1
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================================================
+# HEALTH CHECK
 # ============================================================================
 
 @app.get("/api/v1/health")
 def health_check():
-    """Health check endpoint"""
-    try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1")
-            cursor.close()
-        return {
-            "status": "healthy",
-            "database": "connected",
-            "timestamp": datetime.now().isoformat()
-        }
-    except Exception as e:
-        logger.error(f"Health check failed: {str(e)}")
-        raise HTTPException(status_code=503, detail=f"Service Unavailable: {str(e)}")
-
-# ============================================================================
-# ROOT ENDPOINT
-# ============================================================================
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 @app.get("/")
 def root():
-    """Root endpoint with API information"""
     return {
-        "service": "KYC Deduplication & Blacklist Engine",
-        "version": "2.0.0",
+        "service": "KYC Deduplication & Loan Management System",
+        "version": "3.0.0",
         "endpoints": {
-            "deduplication": "/api/v1/kyc/dedup (POST)",
-            "health": "/api/v1/health (GET)",
-            "docs": "/docs (GET)",
-            "redoc": "/redoc (GET)"
+            "kyc_dedup": "POST /api/v1/kyc/dedup",
+            "apply_loan": "POST /api/v1/loan/apply",
+            "customer_profile": "GET /api/v1/customer/{identifier}",
+            "health": "GET /api/v1/health",
+            "docs": "GET /docs"
         }
     }
 
-# ============================================================================
-# RUN THE APPLICATION
-# ============================================================================
-
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-        log_level="info"
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
