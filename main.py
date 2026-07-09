@@ -457,21 +457,11 @@ def store_dedup_result(cursor, customer_id: Optional[int], matched_customer_id: 
 
 
 # =============================================================================
-# UPDATED VERDICT DECISION ENGINE - 100% Confidence for PAN/Aadhaar/Mobile
+# VERDICT DECISION ENGINE
 # =============================================================================
 
 def determine_verdict_kyc(confidence: float, is_blacklist: bool, has_matches: bool, 
-                          loan_info: Dict = None, matched_fields: List = None, 
-                          applicant: Dict = None, db_record: Dict = None) -> dict:
-    
-    # Check if any strong identifier matched
-    strong_identifiers = ['pan', 'aadhaar_number', 'mobile_number']
-    has_strong_match = any(field in matched_fields for field in strong_identifiers) if matched_fields else False
-    
-    # If strong identifier matched, set confidence to 100%
-    if has_strong_match:
-        confidence = 1.0  # 100% confidence for PAN/Aadhaar/Mobile match
-    
+                          loan_info: Dict = None, matched_fields: List = None) -> dict:
     if not has_matches:
         return {
             'heading': '✅ CLEAR',
@@ -492,8 +482,12 @@ def determine_verdict_kyc(confidence: float, is_blacklist: bool, has_matches: bo
             'confidence': confidence
         }
     
-    # If any strong identifier matched, classify as EXISTING CUSTOMER with 100% confidence
+    # Check strong identifiers
+    strong_identifiers = ['pan', 'aadhaar_number', 'mobile_number']
+    has_strong_match = any(field in matched_fields for field in strong_identifiers) if matched_fields else False
+    
     if has_strong_match:
+        confidence = 1.0
         if loan_info and loan_info.get('has_multiple_loans', False):
             return {
                 'heading': '👤 EXISTING CUSTOMER',
@@ -522,7 +516,6 @@ def determine_verdict_kyc(confidence: float, is_blacklist: bool, has_matches: bo
                 'confidence': confidence
             }
     
-    # Existing customer with multiple loans (fallback)
     if loan_info and loan_info.get('has_multiple_loans', False) and confidence >= 0.70:
         return {
             'heading': '👤 EXISTING CUSTOMER',
@@ -631,11 +624,19 @@ def find_customer_by_pan(cursor, pan: str) -> Optional[Dict]:
 
 
 def get_customer_loans(cursor, customer_id: int) -> List[Dict]:
+    """Get all loans for a customer with proper column names"""
     cursor.execute("""
         SELECT 
-            loan_id, loan_account_no, loan_type, loan_amount, 
-            interest_rate, loan_term_months, loan_status, 
-            application_date, approval_date, disbursement_date
+            loan_id,
+            loan_account_no,
+            loan_type,
+            loan_amount,
+            interest_rate,
+            loan_term_months,
+            loan_status,
+            application_date,
+            approval_date,
+            disbursement_date
         FROM loan_accounts 
         WHERE customer_id = %s
         ORDER BY application_date DESC
@@ -714,33 +715,79 @@ def find_exact_customer(cursor, applicant: Dict) -> Optional[Dict]:
 
 
 def check_conflicts(cursor, applicant: Dict) -> Dict:
+    """
+    Check for conflicts with existing customer records.
+    Only matches on EXACT identifiers (PAN, Aadhaar, Mobile).
+    """
     conflict_messages = []
     matched_customer_id = None
-
+    conflict_details = []
+    
+    # Clean mobile number
+    cleaned_mobile = re.sub(r'\D', '', applicant.get('mobile_number', ''))[-10:]
+    
+    # Check PAN - EXACT match only (case-insensitive)
     if applicant.get('pan'):
-        cursor.execute("SELECT customer_id FROM existing_customers_rec WHERE pan = %s", (applicant['pan'],))
+        cursor.execute("""
+            SELECT customer_id, name, pan 
+            FROM existing_customers_rec 
+            WHERE UPPER(pan) = UPPER(%s)
+        """, (applicant['pan'].strip(),))
         pan_result = cursor.fetchone()
         if pan_result:
-            conflict_messages.append("⚠️ PAN already exists for another customer")
+            conflict_messages.append(f"⚠️ PAN {applicant['pan']} already exists for customer: {pan_result['name']}")
             matched_customer_id = pan_result['customer_id']
-
+            conflict_details.append({
+                'field': 'pan',
+                'value': applicant['pan'],
+                'existing_customer_id': pan_result['customer_id'],
+                'existing_customer_name': pan_result['name']
+            })
+    
+    # Check Aadhaar - EXACT match only
     if applicant.get('aadhaar_number'):
-        cursor.execute("SELECT customer_id FROM existing_customers_rec WHERE aadhaar_number = %s", (applicant['aadhaar_number'],))
+        cursor.execute("""
+            SELECT customer_id, name, aadhaar_number 
+            FROM existing_customers_rec 
+            WHERE aadhaar_number = %s
+        """, (applicant['aadhaar_number'].strip(),))
         aadhaar_result = cursor.fetchone()
         if aadhaar_result:
-            conflict_messages.append("⚠️ Aadhaar number already exists for another customer")
+            conflict_messages.append(f"⚠️ Aadhaar {applicant['aadhaar_number']} already exists for customer: {aadhaar_result['name']}")
             if not matched_customer_id:
                 matched_customer_id = aadhaar_result['customer_id']
-
-    if applicant.get('mobile_number'):
-        cursor.execute("SELECT customer_id FROM existing_customers_rec WHERE mobile_number = %s", (applicant['mobile_number'],))
+            conflict_details.append({
+                'field': 'aadhaar_number',
+                'value': applicant['aadhaar_number'],
+                'existing_customer_id': aadhaar_result['customer_id'],
+                'existing_customer_name': aadhaar_result['name']
+            })
+    
+    # Check Mobile - EXACT match only (cleaned)
+    if applicant.get('mobile_number') and cleaned_mobile:
+        cursor.execute("""
+            SELECT customer_id, name, mobile_number 
+            FROM existing_customers_rec 
+            WHERE mobile_number = %s
+        """, (cleaned_mobile,))
         mobile_result = cursor.fetchone()
         if mobile_result:
-            conflict_messages.append("⚠️ Phone number already exists for another customer")
+            conflict_messages.append(f"⚠️ Mobile {cleaned_mobile} already exists for customer: {mobile_result['name']}")
             if not matched_customer_id:
                 matched_customer_id = mobile_result['customer_id']
-
-    return {"conflict_messages": conflict_messages, "matched_customer_id": matched_customer_id}
+            conflict_details.append({
+                'field': 'mobile_number',
+                'value': cleaned_mobile,
+                'existing_customer_id': mobile_result['customer_id'],
+                'existing_customer_name': mobile_result['name']
+            })
+    
+    return {
+        "conflict_messages": conflict_messages, 
+        "matched_customer_id": matched_customer_id,
+        "conflict_details": conflict_details,
+        "has_conflict": len(conflict_messages) > 0
+    }
 
 
 # =============================================================================
@@ -790,7 +837,9 @@ def process_dedup_api(event: KycEventPayload):
                     "action": "Immediate rejection required. Please do not proceed with this application.",
                     "header_class": "error",
                     "reason": blacklist_matches[0]['record']['reason'],
-                    "confidence": 1.0
+                    "confidence": 1.0,
+                    "customer_id": None,
+                    "customer_name": None
                 }
             
             # 2. Search for matches
@@ -833,7 +882,6 @@ def process_dedup_api(event: KycEventPayload):
                     print(f"{Colors.YELLOW}📌 Total Loans:{Colors.RESET} {loan_info['loan_count']}")
                     print(f"{Colors.YELLOW}📌 Loan Accounts:{Colors.RESET} {', '.join(loan_info['loan_accounts'])}")
                 
-                # Determine verdict with updated logic
                 verdict = determine_verdict_kyc(
                     final_confidence, 
                     False, 
@@ -842,7 +890,6 @@ def process_dedup_api(event: KycEventPayload):
                     matched_fields
                 )
                 
-                # Get the final confidence from the verdict
                 final_confidence = verdict.get('confidence', final_confidence)
                 
                 response = {
@@ -919,15 +966,29 @@ def apply_loan(application: LoanApplication):
         with get_db_connection() as conn:
             cursor = conn.cursor(cursor_factory=RealDictCursor)
             
+            # Clean and normalize applicant data
+            cleaned_mobile = re.sub(r'\D', '', application.mobile_number)[-10:]
+            
             applicant = {
                 'name': application.name.strip().lower(),
                 'dob': application.dob,
                 'aadhaar_number': application.aadhaar_number.strip(),
                 'pan': application.pan.upper().strip(),
-                'mobile_number': ''.join(filter(str.isdigit, application.mobile_number))[-10:],
+                'mobile_number': cleaned_mobile,
                 'email': application.email,
                 'address': application.address.strip().lower()
             }
+            
+            # Log the applicant details for debugging
+            print(f"\n{Colors.CYAN}{Colors.BOLD}{'='*60}{Colors.RESET}")
+            print(f"{Colors.CYAN}{Colors.BOLD}📝 LOAN APPLICATION{Colors.RESET}")
+            print(f"{Colors.CYAN}{Colors.BOLD}{'='*60}{Colors.RESET}")
+            print(f"{Colors.BLUE}📌 Name: {application.name}{Colors.RESET}")
+            print(f"{Colors.BLUE}📌 PAN: {applicant['pan']}{Colors.RESET}")
+            print(f"{Colors.BLUE}📌 Aadhaar: {applicant['aadhaar_number']}{Colors.RESET}")
+            print(f"{Colors.BLUE}📌 Mobile: {applicant['mobile_number']}{Colors.RESET}")
+            print(f"{Colors.BLUE}📌 Loan Type: {application.loan_type}{Colors.RESET}")
+            print(f"{Colors.BLUE}📌 Loan Amount: ₹{application.loan_amount:,.2f}{Colors.RESET}")
             
             # 1. Check Blacklist
             blacklist = check_blacklist_loan(
@@ -943,26 +1004,80 @@ def apply_loan(application: LoanApplication):
                     "verdict": "BLACKLISTED",
                     "action": "Immediate rejection required. Customer is blacklisted.",
                     "header_class": "error",
-                    "reason": blacklist['reason']
+                    "customer_id": None,
+                    "customer_name": None,
+                    "reason": blacklist['reason'],
+                    "confidence": 1.0
                 }
             
-            # 2. Exact Customer Match
-            exact_customer = find_exact_customer(cursor, applicant)
-            if exact_customer:
-                customer_id = exact_customer['customer_id']
-                loans = get_customer_loans(cursor, customer_id)
+            # 2. Check if customer already exists with EXACT match
+            # First check if any identifier already exists
+            existing_customer = None
+            
+            # Check by PAN
+            cursor.execute("""
+                SELECT customer_id, name, pan, aadhaar_number, mobile_number
+                FROM existing_customers_rec 
+                WHERE UPPER(pan) = UPPER(%s)
+            """, (applicant['pan'],))
+            pan_customer = cursor.fetchone()
+            if pan_customer:
+                existing_customer = pan_customer
+                print(f"{Colors.YELLOW}⚠️ Found existing customer by PAN: {pan_customer['name']} (ID: {pan_customer['customer_id']}){Colors.RESET}")
+            
+            # Check by Aadhaar if not found by PAN
+            if not existing_customer:
+                cursor.execute("""
+                    SELECT customer_id, name, pan, aadhaar_number, mobile_number
+                    FROM existing_customers_rec 
+                    WHERE aadhaar_number = %s
+                """, (applicant['aadhaar_number'],))
+                aadhaar_customer = cursor.fetchone()
+                if aadhaar_customer:
+                    existing_customer = aadhaar_customer
+                    print(f"{Colors.YELLOW}⚠️ Found existing customer by Aadhaar: {aadhaar_customer['name']} (ID: {aadhaar_customer['customer_id']}){Colors.RESET}")
+            
+            # Check by Mobile if not found by PAN or Aadhaar
+            if not existing_customer:
+                cursor.execute("""
+                    SELECT customer_id, name, pan, aadhaar_number, mobile_number
+                    FROM existing_customers_rec 
+                    WHERE mobile_number = %s
+                """, (applicant['mobile_number'],))
+                mobile_customer = cursor.fetchone()
+                if mobile_customer:
+                    existing_customer = mobile_customer
+                    print(f"{Colors.YELLOW}⚠️ Found existing customer by Mobile: {mobile_customer['name']} (ID: {mobile_customer['customer_id']}){Colors.RESET}")
+            
+            # If customer exists, add loan to existing customer
+            if existing_customer:
+                customer_id = existing_customer['customer_id']
                 
+                # Check if loan account number already exists
                 if application.loan_account_no:
                     loan_account_no = application.loan_account_no.strip()
                     cursor.execute("SELECT loan_id FROM loan_accounts WHERE loan_account_no = %s", (loan_account_no,))
                     if cursor.fetchone():
-                        return {"status": "ERROR", "message": f"Loan account {loan_account_no} already exists"}
+                        return {
+                            "status": "ERROR", 
+                            "message": f"Loan account {loan_account_no} already exists",
+                            "customer_id": customer_id,
+                            "customer_name": existing_customer['name'],
+                            "confidence": 1.0
+                        }
                 else:
                     cursor.execute("SELECT COALESCE(MAX(loan_id), 0) + 1 AS next_id FROM loan_accounts")
                     next_id = cursor.fetchone()['next_id']
                     loan_account_no = f"LN{next_id:04d}"
                 
+                # Get loan terms
                 interest_rate, term_months = get_loan_terms(application.loan_type)
+                if application.interest_rate:
+                    interest_rate = application.interest_rate
+                if application.loan_term_months:
+                    term_months = application.loan_term_months
+                
+                # Create loan
                 loan_data = {
                     'loan_account_no': loan_account_no,
                     'loan_type': application.loan_type,
@@ -978,12 +1093,14 @@ def apply_loan(application: LoanApplication):
                 
                 return {
                     "heading": "👤 EXISTING CUSTOMER",
-                    "status": f"EXISTING CUSTOMER – New loan added. Total loans: {loan_count}",
+                    "status": f"EXISTING CUSTOMER – New loan added to existing customer. Total loans: {loan_count}",
                     "verdict": "EXISTING_CUSTOMER_NEW_LOAN",
                     "action": f"Loan successfully added to customer ID {customer_id}. Total loans now: {loan_count}",
                     "header_class": "warning",
                     "customer_id": customer_id,
-                    "customer": exact_customer,
+                    "customer_name": existing_customer['name'],
+                    "confidence": 1.0,
+                    "customer": existing_customer,
                     "new_loan": {
                         "loan_id": loan_id,
                         "loan_account_no": loan_account_no,
@@ -996,33 +1113,38 @@ def apply_loan(application: LoanApplication):
                     "total_loans": loan_count
                 }
             
-            # 3. Conflict Detection
-            conflict_result = check_conflicts(cursor, applicant)
-            if conflict_result['conflict_messages']:
-                return {
-                    "heading": "⚠️ CONFLICT DETECTED",
-                    "status": "CONFLICT DETECTED – Conflicts found with existing customer records.",
-                    "verdict": "CONFLICT",
-                    "action": "Manual verification required. Please review the conflicts before proceeding.",
-                    "header_class": "error",
-                    "conflict_messages": conflict_result['conflict_messages'],
-                    "matched_customer_id": conflict_result['matched_customer_id']
-                }
+            # 3. No existing customer found - Create new customer
+            print(f"{Colors.GREEN}✅ No existing customer found. Creating new customer...{Colors.RESET}")
             
-            # 4. New Customer
+            # Get loan terms
             interest_rate, term_months = get_loan_terms(application.loan_type)
+            if application.interest_rate:
+                interest_rate = application.interest_rate
+            if application.loan_term_months:
+                term_months = application.loan_term_months
             
+            # Generate loan account number
             if application.loan_account_no:
                 loan_account_no = application.loan_account_no.strip()
                 cursor.execute("SELECT loan_id FROM loan_accounts WHERE loan_account_no = %s", (loan_account_no,))
                 if cursor.fetchone():
-                    return {"status": "ERROR", "message": f"Loan account {loan_account_no} already exists"}
+                    return {
+                        "status": "ERROR", 
+                        "message": f"Loan account {loan_account_no} already exists",
+                        "customer_id": None,
+                        "customer_name": None,
+                        "confidence": 0.0
+                    }
             else:
                 cursor.execute("SELECT COALESCE(MAX(loan_id), 0) + 1 AS next_id FROM loan_accounts")
                 next_id = cursor.fetchone()['next_id']
                 loan_account_no = f"LN{next_id:04d}"
             
+            # Create customer
             customer_id = create_customer(cursor, applicant)
+            print(f"{Colors.GREEN}✅ Customer created with ID: {customer_id}{Colors.RESET}")
+            
+            # Create loan
             loan_data = {
                 'loan_account_no': loan_account_no,
                 'loan_type': application.loan_type,
@@ -1034,12 +1156,18 @@ def apply_loan(application: LoanApplication):
             loans = get_customer_loans(cursor, customer_id)
             conn.commit()
             
+            print(f"{Colors.GREEN}✅ Loan created with ID: {loan_id}{Colors.RESET}")
+            print(f"{Colors.CYAN}{Colors.BOLD}{'='*60}{Colors.RESET}")
+            
             return {
                 "heading": "✅ NEW CUSTOMER",
                 "status": "NEW CUSTOMER – Customer created successfully with the loan application.",
                 "verdict": "NEW_CUSTOMER",
                 "action": f"New customer created with loan account {loan_account_no}. Total loans: 1",
                 "header_class": "success",
+                "customer_id": customer_id,
+                "customer_name": application.name,
+                "confidence": 0.0,
                 "customer": {
                     "customer_id": customer_id,
                     "name": application.name,
@@ -1074,15 +1202,21 @@ def get_customer_profile(identifier: str):
     try:
         with get_db_connection() as conn:
             cursor = conn.cursor(cursor_factory=RealDictCursor)
+            
+            # Get customer details
             cursor.execute("""
                 SELECT customer_id, name, dob, aadhaar_number, pan, mobile_number, email, address
                 FROM existing_customers_rec 
-                WHERE aadhaar_number = %s OR mobile_number = %s OR pan = %s
+                WHERE aadhaar_number = %s OR mobile_number = %s OR UPPER(pan) = UPPER(%s)
             """, (identifier, identifier, identifier))
+            
             customer = cursor.fetchone()
             if not customer:
                 raise HTTPException(status_code=404, detail="Customer not found")
+            
+            # Get all loans for this customer
             loans = get_customer_loans(cursor, customer['customer_id'])
+            
             return {
                 "status": "SUCCESS",
                 "customer": customer,
@@ -1090,10 +1224,11 @@ def get_customer_profile(identifier: str):
                 "total_loans": len(loans),
                 "has_multiple_loans": len(loans) > 1
             }
+            
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error: {str(e)}")
+        logger.error(f"Customer profile error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -1195,6 +1330,42 @@ def get_dedup_results(limit: int = 50):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ---- DEBUG ENDPOINT ----
+
+@app.get("/api/v1/debug/check-identifier")
+def check_identifier(identifier_type: str, value: str):
+    """Debug endpoint to check if an identifier exists in the system"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            
+            if identifier_type == "pan":
+                cursor.execute("SELECT customer_id, name, pan FROM existing_customers_rec WHERE UPPER(pan) = UPPER(%s)", (value,))
+            elif identifier_type == "aadhaar":
+                cursor.execute("SELECT customer_id, name, aadhaar_number FROM existing_customers_rec WHERE aadhaar_number = %s", (value,))
+            elif identifier_type == "mobile":
+                cleaned = re.sub(r'\D', '', value)[-10:]
+                cursor.execute("SELECT customer_id, name, mobile_number FROM existing_customers_rec WHERE mobile_number = %s", (cleaned,))
+            else:
+                return {"error": "Invalid identifier type. Use: pan, aadhaar, mobile"}
+            
+            result = cursor.fetchone()
+            if result:
+                return {
+                    "exists": True,
+                    "customer_id": result['customer_id'],
+                    "customer_name": result['name'],
+                    "identifier_value": result.get(identifier_type) if identifier_type in result else value
+                }
+            else:
+                return {
+                    "exists": False,
+                    "message": f"No customer found with this {identifier_type}: {value}"
+                }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ---- HEALTH CHECK ----
 
 @app.get("/api/v1/health")
@@ -1216,6 +1387,7 @@ def root():
             "blacklist_add": "POST /api/v1/blacklist/add",
             "blacklist_remove": "DELETE /api/v1/blacklist/remove/{blacklist_id}",
             "dedup_results": "GET /api/v1/dedup/results",
+            "debug_check": "GET /api/v1/debug/check-identifier?identifier_type=pan&value=ABCDE1234F",
             "health": "GET /api/v1/health",
             "docs": "GET /docs"
         }
